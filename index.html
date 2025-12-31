@@ -345,9 +345,10 @@
             const lerpFactor = 0.05;
             const time = Date.now() * 0.001;
 
-            // 斥力参数
-            const repulsionRadius = 150; // 斥力半径
-            const repulsionForce = 200;  // 斥力强度
+            // 斥力参数（做成“轻微波动”，不要把文字打散）
+            const repulsionRadius = 90;  // 影响范围（越小越像局部波动）
+            const repulsionForce = 35;   // 推开强度（越小越柔和）
+            const maxOffset = 18;        // 单帧最大位移限制
 
             for (let i = 0; i < PARTICLE_COUNT; i++) {
                 const target = targetPositions[i];
