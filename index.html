@@ -419,9 +419,12 @@
                 isHandDetected = true;
                 const landmarks = results.multiHandLandmarks[0]; 
                 
-                const palm = landmarks[9]; 
-                const screenX = 1 - palm.x; 
+                const palm = landmarks[9];
+                // 已启用 selfieMode:true，landmarks 的坐标会与“镜像自拍”一致
+                // 同时 video 也做了 CSS 镜像，所以这里不要再做 1-x 的二次镜像
+                const screenX = palm.x;
                 const screenY = palm.y;
+
 
                 handPosition.x = (screenX - 0.5) * visibleWidth;
                 handPosition.y = -(screenY - 0.5) * visibleHeight; 
