@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 粒子手势交互系统</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000;
+            font-family: 'Arial', sans-serif;
+        }
+        #canvas-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 2; /* 粒子在最上层 */
+            pointer-events: none; /* 让鼠标事件穿透 */
+        }
+        #video-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 1; /* 视频在底层 */
+            overflow: hidden;
+        }
+        video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover; /* 全屏填充 */
+            transform: scaleX(-1); /* 镜像翻转 */
+            opacity: 0.6; /* 稍微降低透明度，让粒子更清晰 */
+        }
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            z-index: 10;
+            pointer-events: none;
+        }
+        #instructions {
+            display: none; 
+        }
+    </style>
+    <!-- Three.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <!-- MediaPipe Hands -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+</head>
+<body>
+    <div id="loading">正在加载模型和摄像头...</div>
+    <div id="canvas-container"></div>
+    <div id="video-container">
+        <video id="input_video" playsinline autoplay muted></video>
+    </div>
+
+    <script>
+        // --- 配置 ---
+        const PARTICLE_COUNT = 10000; // 粒子总数
+        const PARTICLE_SIZE = 3;
+        const CANVAS_WIDTH = 1000; // 用于生成文字的画布宽度
+        const CANVAS_HEIGHT = 500;
+        
+        // --- 全局变量 ---
+        let scene, camera, renderer, particles, geometry;
+        let targetPositions = []; // 目标位置数组
+        let currentPositions = []; // 当前位置数组
+        let colors = [];
+        let isHandDetected = false;
+        let currentGesture = '5'; // 默认扩散
+        
+        // 手部交互相关
+        let handPosition = new THREE.Vector3(9999, 9999, 0); // 手部在世界坐标中的位置
+        let visibleWidth, visibleHeight; // 视口在 z=0 处的物理宽高
+
+        // 辅助函数：生成圆形纹理
+        function createCircleTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+            
+            // 绘制实心圆，边缘清晰
+            ctx.beginPath();
+            ctx.arc(32, 32, 28, 0, Math.PI * 2);
+            ctx.fillStyle = 'white';
+            ctx.fill();
+            
+            const texture = new THREE.CanvasTexture(canvas);
+            return texture;
+        }
+
+        // 初始化 Three.js
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            
+            scene = new THREE.Scene();
+            // 移除雾效或减弱，以免影响视频背景观看
+            // scene.fog = new THREE.FogExp2(0x000000, 0.001);
+
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 400;
+
+            // 计算视口大小，用于坐标映射
+            updateVisibleSize();
+
+            renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            container.appendChild(renderer.domElement);
+
+            // 创建粒子系统
+            geometry = new THREE.BufferGeometry();
+            const positions = new Float32Array(PARTICLE_COUNT * 3);
+            const colorArray = new Float32Array(PARTICLE_COUNT * 3);
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // 初始随机位置
+                positions[i * 3] = (Math.random() - 0.5) * 1000;
+                positions[i * 3 + 1] = (Math.random() - 0.5) * 1000;
+                positions[i * 3 + 2] = (Math.random() - 0.5) * 1000;
+
+                currentPositions.push({
+                    x: positions[i * 3],
+                    y: positions[i * 3 + 1],
+                    z: positions[i * 3 + 2]
+                });
+
+                targetPositions.push({
+                    x: positions[i * 3],
+                    y: positions[i * 3 + 1],
+                    z: positions[i * 3 + 2]
+                });
+
+                // 初始颜色
+                const color = new THREE.Color();
+                color.setHSL(Math.random(), 0.7, 0.5);
+                colorArray[i * 3] = color.r;
+                colorArray[i * 3 + 1] = color.g;
+                colorArray[i * 3 + 2] = color.b;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colorArray, 3));
+
+            // 材质
+            const material = new THREE.PointsMaterial({
+                size: PARTICLE_SIZE,
+                map: createCircleTexture(),
+                vertexColors: true,
+                blending: THREE.NormalBlending,
+                depthTest: false,
+                transparent: true,
+                opacity: 1.0
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            // 监听窗口大小变化
+            window.addEventListener('resize', onWindowResize, false);
+            
+            // 初始状态：扩散
+            setShape('5');
+            
+            animate();
+        }
+
+        function updateVisibleSize() {
+            const vFOV = camera.fov * Math.PI / 180;
+            visibleHeight = 2 * Math.tan(vFOV / 2) * camera.position.z;
+            visibleWidth = visibleHeight * camera.aspect;
+        }
+
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            updateVisibleSize();
+        }
+
+        // --- 形状生成逻辑 ---
+
+        // 1. 生成文字形状的目标点
+        function createTextTargets(text) {
+            const canvas = document.createElement('canvas');
+            canvas.width = CANVAS_WIDTH;
+            canvas.height = CANVAS_HEIGHT;
+            const ctx = canvas.getContext('2d');
+            
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            
+            // 动态调整字体大小以适应
+            let fontSize = 120;
+            if (text.length > 4) fontSize = 80;
+            if (text.length > 8) fontSize = 60;
+            
+            ctx.font = `bold ${fontSize}px "Microsoft YaHei", Arial, sans-serif`;
+            ctx.fillStyle = '#FFFFFF';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(text, CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+
+            const imageData = ctx.getImageData(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+            const data = imageData.data;
+            
+            const validPoints = [];
+            // 采样步长，越小粒子越密集
+            const step = 4; 
+            
+            for (let y = 0; y < CANVAS_HEIGHT; y += step) {
+                for (let x = 0; x < CANVAS_WIDTH; x += step) {
+                    const index = (y * CANVAS_WIDTH + x) * 4;
+                    if (data[index] > 128) { // 红色通道 > 128 认为是文字部分
+                        validPoints.push({
+                            x: (x - CANVAS_WIDTH / 2) * 1.5, // 缩放系数
+                            y: -(y - CANVAS_HEIGHT / 2) * 1.5, // Y轴反转
+                            z: 0
+                        });
+                    }
+                }
+            }
+            
+            return mapPointsToTargets(validPoints);
+        }
+
+        // 2. 生成爱心形状
+        function createHeartTargets() {
+            const validPoints = [];
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const t = Math.random() * Math.PI * 2;
+                const r = Math.sqrt(Math.random()); 
+                
+                let x = 16 * Math.pow(Math.sin(t), 3);
+                let y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                
+                const scale = 10;
+                const z = (Math.random() - 0.5) * 40;
+                
+                x *= r * scale;
+                y *= r * scale;
+
+                validPoints.push({ x, y, z });
+            }
+            return mapPointsToTargets(validPoints);
+        }
+
+        // 3. 生成随机扩散形状
+        function createRandomTargets() {
+            const validPoints = [];
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                validPoints.push({
+                    x: (Math.random() - 0.5) * visibleWidth,
+                    y: (Math.random() - 0.5) * visibleHeight,
+                    z: (Math.random() - 0.5) * 600
+                });
+            }
+            return mapPointsToTargets(validPoints);
+        }
+
+        // 将生成的点映射到 targetPositions
+        function mapPointsToTargets(points) {
+            const newTargets = [];
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const p = points[i % points.length];
+                newTargets.push({
+                    x: p.x,
+                    y: p.y,
+                    z: p.z
+                });
+            }
+            return newTargets;
+        }
+
+        // 设置当前形状
+        function setShape(type) {
+            if (currentGesture === type) return; 
+            currentGesture = type;
+            
+            let newTargets;
+            let colorHue = 0.0; 
+
+            switch (type) {
+                case '1':
+                    newTargets = createTextTargets("祝王龙伞");
+                    colorHue = 0.9; 
+                    break;
+                case '2':
+                    newTargets = createTextTargets("2026 新的一年");
+                    colorHue = 0.1; 
+                    break;
+                case '3':
+                    newTargets = createTextTargets("越来越伞");
+                    colorHue = 0.6; 
+                    break;
+                case '4':
+                    newTargets = createTextTargets("和张婷越来越好");
+                    colorHue = 0.8; 
+                    break;
+                // case '0': 
+                //     newTargets = createHeartTargets();
+                //     colorHue = 0.0; 
+                //     break;
+                case '5': 
+                default:
+                    newTargets = createRandomTargets();
+                    colorHue = Math.random(); 
+                    break;
+            }
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                targetPositions[i] = newTargets[i];
+            }
+            
+            const colorsAttr = geometry.attributes.color;
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const color = new THREE.Color();
+                if (type === '5') {
+                     color.setHSL(Math.random(), 0.7, 0.5);
+                } else {
+                     color.setHSL(colorHue + (Math.random() - 0.5) * 0.1, 0.8, 0.6);
+                }
+                colorsAttr.setXYZ(i, color.r, color.g, color.b);
+            }
+            colorsAttr.needsUpdate = true;
+        }
+
+        // --- 动画循环 ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const positions = geometry.attributes.position.array;
+            const lerpFactor = 0.05;
+            const time = Date.now() * 0.001;
+
+            // 斥力参数
+            const repulsionRadius = 150; // 斥力半径
+            const repulsionForce = 200;  // 斥力强度
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                const target = targetPositions[i];
+                const current = currentPositions[i];
+
+                // 1. 基础运动：向目标位置移动
+                current.x += (target.x - current.x) * lerpFactor;
+                current.y += (target.y - current.y) * lerpFactor;
+                current.z += (target.z - current.z) * lerpFactor;
+
+                // 2. 交互逻辑：手部斥力
+                let finalX = current.x;
+                let finalY = current.y;
+                let finalZ = current.z;
+
+                if (isHandDetected) {
+                    const dx = current.x - handPosition.x;
+                    const dy = current.y - handPosition.y;
+                    const distSq = dx * dx + dy * dy;
+                    
+                    if (distSq < repulsionRadius * repulsionRadius) {
+                        const dist = Math.sqrt(distSq);
+                        const force = (1 - dist / repulsionRadius) * repulsionForce;
+                        
+                        const angle = Math.atan2(dy, dx);
+                        
+                        finalX += Math.cos(angle) * force;
+                        finalY += Math.sin(angle) * force;
+                        finalZ += force * 0.5; 
+                    }
+                }
+
+                // 3. 噪点扰动
+                const noise = 2;
+                positions[i * 3] = finalX + Math.sin(time + i) * noise;
+                positions[i * 3 + 1] = finalY + Math.cos(time + i * 0.5) * noise;
+                positions[i * 3 + 2] = finalZ;
+            }
+
+            geometry.attributes.position.needsUpdate = true;
+            
+            // 旋转逻辑控制
+            if (['1', '2', '3', '4'].includes(currentGesture)) {
+                particles.rotation.y += (0 - particles.rotation.y) * 0.1;
+                particles.rotation.x += (0 - particles.rotation.x) * 0.1;
+            } else {
+                particles.rotation.y += 0.002;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- MediaPipe Hands 设置 ---
+        const videoElement = document.getElementById('input_video');
+        // iOS/Safari 需要 playsinline + autoplay + muted 才能内联播放
+        videoElement.setAttribute('playsinline', 'true');
+        videoElement.setAttribute('autoplay', 'true');
+        videoElement.muted = true;
+        // 一旦视频开始播放，移除加载提示，避免长时间停留
+        videoElement.addEventListener('playing', () => {
+            const loadingEl = document.getElementById('loading');
+            if (loadingEl) loadingEl.style.display = 'none';
+        });
+        
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+            
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                isHandDetected = true;
+                const landmarks = results.multiHandLandmarks[0]; 
+                
+                const palm = landmarks[9]; 
+                const screenX = 1 - palm.x; 
+                const screenY = palm.y;
+
+                handPosition.x = (screenX - 0.5) * visibleWidth;
+                handPosition.y = -(screenY - 0.5) * visibleHeight; 
+                handPosition.z = 0; 
+
+                let fingersUp = 0;
+                const dist = (p1, p2) => Math.sqrt(Math.pow(p1.x - p2.x, 2) + Math.pow(p1.y - p2.y, 2));
+                
+                if (dist(landmarks[4], landmarks[17]) > dist(landmarks[3], landmarks[17])) {
+                    fingersUp++;
+                }
+                if (landmarks[8].y < landmarks[6].y) fingersUp++;
+                if (landmarks[12].y < landmarks[10].y) fingersUp++;
+                if (landmarks[16].y < landmarks[14].y) fingersUp++;
+                if (landmarks[20].y < landmarks[18].y) fingersUp++;
+
+                let gesture = '5';
+                if (fingersUp === 0) gesture = '0';
+                else if (fingersUp === 1) gesture = '1';
+                else if (fingersUp === 2) gesture = '2';
+                else if (fingersUp === 3) gesture = '3';
+                else if (fingersUp === 4) gesture = '4';
+                else gesture = '5';
+                
+                setShape(gesture);
+
+            } else {
+                isHandDetected = false;
+                handPosition.set(9999, 9999, 0);
+            }
+        }
+
+        const hands = new Hands({locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+        }});
+
+        hands.setOptions({
+            maxNumHands: 1,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+            selfieMode: true // 镜像自拍模式，提高与视频一致性
+        });
+
+        hands.onResults(onResults);
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({image: videoElement});
+            },
+            width: 1280,
+            height: 720
+        });
+
+        // 启动
+        initThree();
+        (async () => {
+            try {
+                await cameraUtils.start();
+            } catch (err) {
+                console.error('Camera start failed:', err);
+                const loadingEl = document.getElementById('loading');
+                if (loadingEl) loadingEl.textContent = '摄像头启动失败，请点击允许或刷新重试';
+
+                // 备用方案：直接使用 getUserMedia
+                if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia({
+                            video: { facingMode: 'user' },
+                            audio: false
+                        });
+                        videoElement.srcObject = stream;
+                        await videoElement.play();
+                        if (loadingEl) loadingEl.style.display = 'none';
+
+                        // 将帧推送到 MediaPipe
+                        async function pump() {
+                            try {
+                                await hands.send({ image: videoElement });
+                            } catch (e) {
+                                // 忽略偶发错误，继续推帧
+                            }
+                            requestAnimationFrame(pump);
+                        }
+                        pump();
+                    } catch (e) {
+                        console.error('getUserMedia fallback failed:', e);
+                        if (loadingEl) loadingEl.textContent = '无法访问摄像头：请在 Safari 设置中开启权限';
+                    }
+                }
+            }
+        })();
+
+    </script>
+</body>
+</html>
